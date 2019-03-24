@@ -179,7 +179,7 @@ int create_and_bind_unix_socket(const ss_local_addr_t *addr)
         return -1;
 
     unlink(addr->addr);
-    memset(&un, 0, sizeof(sockaddr_un));
+    memset(&un, 0, sizeof(struct sockaddr_un));
     un.sun_family = AF_UNIX;
     strcpy(un.sun_path, addr->addr);
     len = offsetof(struct sockaddr_un, sun_path) + strlen(addr->addr);
@@ -1935,9 +1935,9 @@ main(int argc, char **argv)
         // Setup socket
         int listenfd;
 #ifdef HAVE_LAUNCHD
-        listenfd = launch_or_create(local_addr, local_port);
+        listenfd = launch_or_create(&local_addr, local_port);
 #else
-        listenfd = create_and_bind(local_addr, local_port);
+        listenfd = create_and_bind(&local_addr, local_port);
 #endif
         if (listenfd == -1) {
             FATAL("bind() error");
