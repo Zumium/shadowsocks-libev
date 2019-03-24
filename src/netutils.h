@@ -39,6 +39,8 @@
 #include <netdb.h>
 #endif
 
+#include <stdbool.h>
+
 /* Hard coded defines for TCP fast open on Android */
 #ifdef __ANDROID__
 #ifndef TCP_FASTOPEN
@@ -56,6 +58,11 @@ typedef struct {
     char *host;
     char *port;
 } ss_addr_t;
+
+typedef struct {
+    char *addr;
+    bool is_unix_socket;
+} ss_local_addr_t;
 
 /* MPTCP_ENABLED setsockopt values for kernel 4 & 3, best behaviour to be independant of kernel version is to test from newest to the latest values */
 #ifndef MPTCP_ENABLED
@@ -109,5 +116,7 @@ int sockaddr_cmp_addr(struct sockaddr_storage *addr1,
 int validate_hostname(const char *hostname, const int hostname_len);
 
 int is_ipv6only(ss_addr_t *servers, size_t server_num, int ipv6first);
+
+bool is_local_addr_unix_socket(ss_local_addr_t *local_addr);
 
 #endif

@@ -301,3 +301,16 @@ is_ipv6only(ss_addr_t *servers, size_t server_num, int ipv6first)
     }
     return 1;
 }
+
+bool is_local_addr_unix_socket(ss_local_addr_t *local_addr)
+{
+    char *first_char = local_addr->addr;
+
+    if (*first_char != '/')
+    {
+        return (local_addr->is_unix_socket = false);
+    }
+
+    return (local_addr->is_unix_socket = true);
+}
+

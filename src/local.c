@@ -26,6 +26,8 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <locale.h>
 #include <signal.h>
@@ -33,6 +35,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <stddef.h>
 #ifndef __MINGW32__
 #include <errno.h>
 #include <arpa/inet.h>
@@ -138,9 +141,9 @@ static void signal_cb(EV_P_ ev_signal *w, int revents);
 static void plugin_watcher_cb(EV_P_ ev_io *w, int revents);
 #endif
 
-static int create_and_bind(const char *addr, const char *port);
+static int create_and_bind(const ss_local_addr_t *addr, const char *port);
 #ifdef HAVE_LAUNCHD
-static int launch_or_create(const char *addr, const char *port);
+static int launch_or_create(const ss_local_addr_t *addr, const char *port);
 #endif
 static remote_t *create_remote(listen_ctx_t *listener, struct sockaddr *addr, int direct);
 static void free_remote(remote_t *remote);
@@ -166,19 +169,48 @@ setnonblocking(int fd)
 
 #endif
 
+int create_and_bind_unix_socket(const ss_local_addr_t *addr)
+{
+    int listen_sock, len, ret;
+    struct sockaddr_un un;
+
+    listen_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_sock < 0)
+        return -1;
+
+    unlink(addr->addr);
+    memset(&un, 0, sizeof(sockaddr_un));
+    un.sun_family = AF_UNIX;
+    strcpy(un.sun_path, addr->addr);
+    len = offsetof(struct sockaddr_un, sun_path) + strlen(addr->addr);
+
+    ret = bind(listen_sock, (struct sockaddr *)&un, len);
+    if (ret < 0)
+    {
+        ERROR("unix socket bind");
+        return -1;
+    }
+
+    return listen_sock;
+}
+
 int
-create_and_bind(const char *addr, const char *port)
+create_and_bind(const ss_local_addr_t *addr, const char *port)
 {
     struct addrinfo hints;
     struct addrinfo *result, *rp;
     int s, listen_sock;
+
+    /* goto another flow if listening on unix socket */
+    if (addr->is_unix_socket) 
+        return create_and_bind_unix_socket(addr);
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family   = AF_UNSPEC;   /* Return IPv4 and IPv6 choices */
     hints.ai_socktype = SOCK_STREAM; /* We want a TCP socket */
     result            = NULL;
 
-    s = getaddrinfo(addr, port, &hints, &result);
+    s = getaddrinfo(addr->addr, port, &hints, &result);
 
     if (s != 0) {
         LOGI("getaddrinfo: %s", gai_strerror(s));
@@ -227,7 +259,7 @@ create_and_bind(const char *addr, const char *port)
 
 #ifdef HAVE_LAUNCHD
 int
-launch_or_create(const char *addr, const char *port)
+launch_or_create(const ss_local_addr_t *addr, const char *port)
 {
     int *fds;
     size_t cnt;
@@ -1450,7 +1482,7 @@ main(int argc, char **argv)
     int mptcp        = 0;
     char *user       = NULL;
     char *local_port = NULL;
-    char *local_addr = NULL;
+//    char *local_addr = NULL;
     char *password   = NULL;
     char *key        = NULL;
     char *timeout    = NULL;
@@ -1469,8 +1501,12 @@ main(int argc, char **argv)
     ss_addr_t remote_addr[MAX_REMOTE_NUM];
     char *remote_port = NULL;
 
+    ss_local_addr_t local_addr;
+
     memset(remote_addr, 0, sizeof(ss_addr_t) * MAX_REMOTE_NUM);
     srand(time(NULL));
+
+    memset(&local_addr, 0, sizeof(ss_local_addr_t));
 
     static struct option long_options[] = {
         { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
@@ -1562,7 +1598,7 @@ main(int argc, char **argv)
             iface = optarg;
             break;
         case 'b':
-            local_addr = optarg;
+            local_addr.addr = optarg;
             break;
         case 'a':
             user = optarg;
@@ -1630,8 +1666,8 @@ main(int argc, char **argv)
         if (remote_port == NULL) {
             remote_port = conf->remote_port;
         }
-        if (local_addr == NULL) {
-            local_addr = conf->local_addr;
+        if (local_addr.addr == NULL) {
+            local_addr.addr = conf->local_addr;
         }
         if (local_port == NULL) {
             local_port = conf->local_port;
@@ -1747,13 +1783,15 @@ main(int argc, char **argv)
     }
 #endif
 
-    if (local_addr == NULL) {
+    if (local_addr.addr == NULL) {
         if (is_ipv6only(remote_addr, remote_num, ipv6first)) {
-            local_addr = "::1";
+            local_addr.addr = "::1";
         } else {
-            local_addr = "127.0.0.1";
+            local_addr.addr = "127.0.0.1";
         }
     }
+
+    (void)is_local_addr_unix_socket(&local_addr);
 
     USE_SYSLOG(argv[0], pid_flags);
     if (pid_flags) {
@@ -1884,10 +1922,12 @@ main(int argc, char **argv)
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
 #endif
 
-    if (ss_is_ipv6addr(local_addr))
-        LOGI("listening at [%s]:%s", local_addr, local_port);
+    if (local_addr.is_unix_socket)
+        LOGI("listening at unix://%s", local_addr.addr);
+    else if (ss_is_ipv6addr(local_addr.addr))
+        LOGI("listening at [%s]:%s", local_addr.addr, local_port);
     else
-        LOGI("listening at %s:%s", local_addr, local_port);
+        LOGI("listening at %s:%s", local_addr.addr, local_port);
 
     struct ev_loop *loop = EV_DEFAULT;
 
@@ -1914,7 +1954,8 @@ main(int argc, char **argv)
     }
 
     // Setup UDP
-    if (mode != TCP_ONLY) {
+    /* udp not supported when using unix socket local address */
+    if (!local_addr.is_unix_socket && mode != TCP_ONLY) {
         LOGI("udprelay enabled");
         char *host                       = remote_addr[0].host;
         char *port                       = remote_addr[0].port == NULL ? remote_port : remote_addr[0].port;
@@ -1924,7 +1965,7 @@ main(int argc, char **argv)
             FATAL("failed to resolve the provided hostname");
         }
         struct sockaddr *addr = (struct sockaddr *)storage;
-        udp_fd = init_udprelay(local_addr, local_port, addr,
+        udp_fd = init_udprelay(local_addr.addr, local_port, addr,
                                get_sockaddr_len(addr), mtu, crypto, listen_ctx.timeout, iface);
     }
 
@@ -1969,7 +2010,7 @@ main(int argc, char **argv)
         ss_free(listen_ctx.remote_addr);
     }
 
-    if (mode != TCP_ONLY) {
+    if (!local_addr.is_unix_socket && mode != TCP_ONLY) {
         free_udprelay();
     }
 
@@ -1991,8 +2032,10 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
 {
     srand(time(NULL));
 
+    ss_local_addr_t local_addr;
+    memset(&local_addr, 0, sizeof(ss_local_addr_t));
+
     char *remote_host = profile.remote_host;
-    char *local_addr  = profile.local_addr;
     char *method      = profile.method;
     char *password    = profile.password;
     char *log         = profile.log;
@@ -2007,6 +2050,7 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     verbose   = profile.verbose;
     mtu       = profile.mtu;
     mptcp     = profile.mptcp;
+    local_addr.addr = profile.local_addr;
 
     char local_port_str[16];
     char remote_port_str[16];
@@ -2024,9 +2068,11 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         acl = !init_acl(profile.acl);
     }
 
-    if (local_addr == NULL) {
-        local_addr = "127.0.0.1";
+    if (local_addr.addr == NULL) {
+        local_addr.addr = "127.0.0.1";
     }
+
+    (void)is_local_addr_unix_socket(&local_addr);
 
 #ifndef __MINGW32__
     // ignore SIGPIPE
@@ -2067,15 +2113,17 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     listen_ctx.iface          = NULL;
     listen_ctx.mptcp          = mptcp;
 
-    if (ss_is_ipv6addr(local_addr))
-        LOGI("listening at [%s]:%s", local_addr, local_port_str);
+    if (local_addr.is_unix_socket)
+        LOGI("listening at sock://%s", local_addr.addr);
+    else if (ss_is_ipv6addr(local_addr.addr))
+        LOGI("listening at [%s]:%s", local_addr.addr, local_port_str);
     else
-        LOGI("listening at %s:%s", local_addr, local_port_str);
+        LOGI("listening at %s:%s", local_addr.addr, local_port_str);
 
     if (mode != UDP_ONLY) {
         // Setup socket
         int listenfd;
-        listenfd = create_and_bind(local_addr, local_port_str);
+        listenfd = create_and_bind(&local_addr, local_port_str);
         if (listenfd == -1) {
             ERROR("bind()");
             return -1;
@@ -2093,10 +2141,10 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     }
 
     // Setup UDP
-    if (mode != TCP_ONLY) {
+    if (!local_addr.is_unix_socket && mode != TCP_ONLY) {
         LOGI("udprelay enabled");
         struct sockaddr *addr = (struct sockaddr *)(&storage);
-        udp_fd = init_udprelay(local_addr, local_port_str, addr,
+        udp_fd = init_udprelay(local_addr.addr, local_port_str, addr,
                                get_sockaddr_len(addr), mtu, crypto, timeout, NULL);
     }
 
@@ -2121,7 +2169,7 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         close(listen_ctx.fd);
     }
 
-    if (mode != TCP_ONLY) {
+    if (!local_addr.is_unix_socket && mode != TCP_ONLY) {
         free_udprelay();
     }
 
